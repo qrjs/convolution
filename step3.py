@@ -1,5 +1,7 @@
 from lib import *
 
+# 将 (Channel, Height, Width) 格式的输入特征图 (IFM) 转换为矩阵 (M, K)
+# 这就是著名的 im2col (Image to Column) 变换
 def CHW2MK(ifm, layer):
     out_height = layer['out_height']
     out_width = layer['out_width']
@@ -14,18 +16,33 @@ def CHW2MK(ifm, layer):
     pad_w = layer['pad_w']
     dilation_h = layer['dilation_h']
     dilation_w = layer['dilation_w']
+    
+    # M: 卷积滑动的次数 (输出特征图的像素点总数)
     M = out_height * out_width
+    # K: 每一个卷积核窗口内的元素数量 (C * Kh * Kw)
     K = in_channel * kernel_h * kernel_w
 
+    # 初始化矩阵
     ofm = np.zeros((M, K))
+    
+    # 遍历输出特征图的每一个坐标 (oh, ow) -> 对应矩阵的一行
     for oh in range(out_height):
         for ow in range(out_width):
+            m_idx = oh * out_width + ow
+            # 遍历卷积核的每一个坐标 (kh, kw) -> 对应矩阵的一列中的一部分
             for kh in range(kernel_h):
                 for kw in range(kernel_w):
-                    ih = 
-                    iw = 
+                    # 计算当前卷积核坐标对应输入图上的坐标 (考虑 stride 和 dilation)
+                    ih = oh * stride_h - pad_h + kh * dilation_h
+                    iw = ow * stride_w - pad_w + kw * dilation_w
+                    
+                    # 如果 ih, iw 在输入图范围内且不是 pad 部分
                     if (0 <= ih < in_height) and (0 <= iw < in_width):
+                        # 遍历输入通道
                         for ic in range(in_channel):
+                            # 计算 K 维度的索引： ic * Kh * Kw + kh * Kw + kw
+                            k_idx = ic * kernel_h * kernel_w + kh * kernel_w + kw
+                            ofm[m_idx][k_idx] = ifm[ic][ih][iw]
     return ofm
 
 def test_im2col():

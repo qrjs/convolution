@@ -1,41 +1,77 @@
 from lib import *
 
+# 将 DDR 中的 BHWC 布局特征图转换为 L1 中的 C1BHWC0 布局
 def BHWC2C1BHWC0_DDR2L1(ifm, batch, tensor_h, tensor_w, tensor_c, start_tensor_h, start_tensor_w, start_tensor_c, tile_h, tile_w, tile_c):
+    # 计算 C1 维度的大小，C1 = ceil(tile_c / C0)
     C1 = ceil_div(tile_c, C0)
+    # 初始化 L1 中的 C1BHWC0 布局的特征图，默认填充0
     ifm_C1BHWC0 = np.zeros((C1, batch, tile_h, tile_w, C0))
+    # 检查 DDR 数据维度是否与传入的 tensor_h, tensor_w, tensor_c 一致
     assert(ifm.shape[1] == tensor_h)
     assert(ifm.shape[2] == tensor_w)
     assert(ifm.shape[3] == tensor_c)
+    # 遍历 L1 瓦片的 C1, B, H, W, C0 维度
     for c1 in range(C1):
         for b in range(batch):
             for h in range(tile_h):
                 for w in range(tile_w):
                     for c0 in range(C0):
+                        # 计算当前 L1 瓦片元素在原始 DDR 特征图中的全局通道索引
+                        c = start_tensor_c + c1 * C0 + c0
+                        # 计算当前 L1 瓦片元素在原始 DDR 特征图中的全局高度索引
+                        gh = start_tensor_h + h
+                        # 计算当前 L1 瓦片元素在原始 DDR 特征图中的全局宽度索引
+                        gw = start_tensor_w + w
+                        # 检查全局索引是否在原始特征图的有效范围内
+                        if gh < tensor_h and gw < tensor_w and c < tensor_c:
+                            # 如果在有效范围内，则从 DDR 复制数据到 L1 瓦片
+                            ifm_C1BHWC0[c1][b][h][w][c0] = ifm[b][gh][gw][c]
+                        # 如果超出范围，由于 ifm_C1BHWC0 已经初始化为0，所以无需额外处理，实现了padding
+    return ifm_C1BHWC0
 
-    return ifm_C1BHWC0.reshape((C1, batch, tile_h, tile_w, C0))
-
+# 矩阵乘法核心，同 Step 2
 def matmul_m1k1m0k0_n1k1n0k0(m1n1m0n0, m1k1m0k0, n1k1n0k0, bias_n1n0, deq_n1n0, M1, N1, K1, bias_en, psum_en, deq_en):
-    assert(m1k1m0k0.shape[1] == n1k1n0k0.shape[1])
-    assert(m1k1m0k0.shape[3] == n1k1n0k0.shape[3])
+    # 检查 K 维度是否匹配
+    assert(m1k1m0k0.shape[1] == n1k1n0k0.shape[1]) # K1
+    assert(m1k1m0k0.shape[3] == n1k1n0k0.shape[3]) # K0
+    # 遍历 M1 和 N1 维度，处理输出矩阵的每个 M0xN0 块
     for m1 in range(M1):
         for n1 in range(N1):
+            # 初始化一个 M0xN0 的临时累加器
             temp = np.zeros((M0, N0))
+            # 遍历 K1 维度，进行 K0 维度的矩阵乘法累加
             for k1 in range(K1):
+                # m1k1m0k0[m1][k1] 是 M0xK0 矩阵
+                # n1k1n0k0[n1][k1] 是 N0xK0 矩阵，需要转置为 K0xN0
+                temp += m1k1m0k0[m1][k1] @ n1k1n0k0[n1][k1].T
 
+            # 如果 bias_en 为 True，则添加偏置
             if(bias_en):
                 for n0 in range(N0):
+                    # 将偏置 bias_n1n0[n1][n0] 加到 temp 矩阵的每一行
+                    temp[:, n0] += bias_n1n0[n1][n0]
 
+            # 如果 psum_en 为 True，则将当前计算结果累加到 m1n1m0n0
             if(psum_en):
                 m1n1m0n0[m1][n1] += temp
+            # 否则，直接赋值
             else:
                 m1n1m0n0[m1][n1] = temp
-    if(deq_en):
+            
+            # 如果 deq_en 为 True，则进行反量化
+            if(deq_en):
+                # 将 m1n1m0n0[m1][n1] 矩阵的每一列乘以对应的反量化因子 deq_n1n0[n1]
+                # deq_n1n0[n1] 是一个 N0 维向量
+                m1n1m0n0[m1][n1] *= deq_n1n0[n1]
 
     return m1n1m0n0 
 
+# 将 L1 的 C1BHWC0 布局转换为 L0 的 M1K1M0K0 布局 (带 im2col)
 def C1BHWC02M1K1M0K0_L12L0(ifm, batch, slice_oh, slice_ow, slice_c1, start_tile_h, start_tile_w, start_tile_c1, kernel_h, kernel_w, stride_h, stride_w, pad_t, pad_b, pad_l, pad_r, dilation_h, dilation_w, padding_value=0):
-    slice_ih = (slice_oh - 1) * stride_h + dilation_h * (kernel_h - 1) - pad_t - pad_b + 1
-    slice_iw = (slice_ow - 1) * stride_w + dilation_w * (kernel_w - 1) - pad_l - pad_r + 1
+    # 计算当前 Slice 对应的输入特征图尺寸 (不含原始 pad，仅考虑当前切分出的 Slice 所需范围)
+    slice_ih_range = (slice_oh - 1) * stride_h + dilation_h * (kernel_h - 1) - pad_t - pad_b + 1
+    slice_iw_range = (slice_ow - 1) * stride_w + dilation_w * (kernel_w - 1) - pad_l - pad_r + 1
+    
     C1 = slice_c1
     M = batch * slice_oh * slice_ow
     M1 = ceil_div(M, M0)
@@ -47,15 +83,22 @@ def C1BHWC02M1K1M0K0_L12L0(ifm, batch, slice_oh, slice_ow, slice_c1, start_tile_
                 for b in range(batch):
                     for oh in range(slice_oh):
                         for ow in range(slice_ow):
-                            ih = 
-                            iw = 
-                            m_index = 
-                            k1_idx = 
+                            # 计算相对 L1 Tile 起始位置的坐标
+                            # 注意：我们需要补偿 pad，因为 L1 data 是从 valid 区域开始搬运的
+                            ih = oh * stride_h - pad_t + kh * dilation_h
+                            iw = ow * stride_w - pad_l + kw * dilation_w
+                            
+                            m_index = b * slice_oh * slice_ow + oh * slice_ow + ow
+                            k1_idx = ic1 * kernel_h * kernel_w + kh * kernel_w + kw
+                            
                             m1_idx = m_index // M0
                             m0_idx = m_index % M0
-                            if (0 <= ih < slice_ih) and (0 <= iw < slice_iw):
-                                
+                            
+                            # 边界检查：如果 ih, iw 在 [0, slice_ih_range) 范围内，则从 ifm 取值
+                            if (0 <= ih < slice_ih_range) and (0 <= iw < slice_iw_range):
+                                ifm_m1k1m0k0[m1_idx][k1_idx][m0_idx] = ifm[start_tile_c1 + ic1][b][start_tile_h + ih][start_tile_w + iw]
                             else:
+                                # 否则填充 padding_value
                                 for k0_idx in range(K0):
                                     ifm_m1k1m0k0[m1_idx][k1_idx][m0_idx][k0_idx] = padding_value
     return ifm_m1k1m0k0
@@ -178,32 +221,43 @@ def test_convolution():
                                     slice_oc_size = min(oc_size_tile - slice_oc_start_in_tile, CO_L0)
                                     # pad_t, pad_b, pad_l, pad_r分别表示上下左右填充的行数
                                     if(slice_oh_start_in_tensor * stride_h - pad_h < 0):
-                                        slice_pad_t = 
+                                        slice_pad_t = pad_h - slice_oh_start_in_tensor * stride_h
                                     else:
                                         slice_pad_t = 0
-                                    if():
-                                        slice_pad_b = 
+                                    
+                                    if(slice_oh_end_in_tensor * stride_h - pad_h + dilation_h * (kernel_h - 1) >= in_height):
+                                        slice_pad_b = (slice_oh_end_in_tensor * stride_h - pad_h + dilation_h * (kernel_h - 1)) - (in_height - 1)
                                     else:
                                         slice_pad_b = 0
+                                        
                                     if(slice_ow_start_in_tensor * stride_w - pad_w < 0):
-                                        slice_pad_l = 
+                                        slice_pad_l = pad_w - slice_ow_start_in_tensor * stride_w
                                     else:
                                         slice_pad_l = 0
-                                    if():
-                                        slice_pad_r = 
+                                        
+                                    if(slice_ow_end_in_tensor * stride_w - pad_w + dilation_w * (kernel_w - 1) >= in_width):
+                                        slice_pad_r = (slice_ow_end_in_tensor * stride_w - pad_w + dilation_w * (kernel_w - 1)) - (in_width - 1)
                                     else:
                                         slice_pad_r = 0
+                                        
                                     # IC方向的第一次计算需要加偏置
                                     bias_en = (tile_ic_start_in_tensor==0) and (slice_ci1_start_in_tile==0)
-                                    # 思考一下什么情况需要跟上一次的结果累加
-                                    psum_en = 
-                                    # 卷积计算不在KhKw维度切分，只有在卷积计算的IC方向彻底做完，对应矩阵的K维度彻底做完才能进行dequant
-                                    deq_en = 
+                                    # 只有第一次计算不累加 psum
+                                    psum_en = (tile_ic_start_in_tensor != 0 or slice_ci1_start_in_tile != 0)
+                                    # 当处理完所有 IC (K维度) 时进行反量化
+                                    is_last_ci1 = (slice_ci1_start_in_tile + slice_ci1_size >= ci1_size_tile)
+                                    is_last_tile_ic = (tile_ic_start_in_tensor + CI_L1 >= in_channel)
+                                    deq_en = is_last_ci1 and is_last_tile_ic
+                                    
                                     ifm_M1K1M0K0 = C1BHWC02M1K1M0K0_L12L0(ifm_C1BHWC0_tile, batch, slice_oh_size, slice_ow_size, slice_ci1_size, slice_ih_start_in_tile, slice_iw_start_in_tile, slice_ci1_start_in_tile, kernel_h, kernel_w, stride_h, stride_w, slice_pad_t, slice_pad_b, slice_pad_l, slice_pad_r, dilation_h, dilation_w)
                                     weight_N1K1N0K0_slice = K1NK02N1K1N0K0_L12RMB(weight_k1nk0_tile, oc_size_tile, slice_oc_start_in_tile, slice_ci1_start_in_tile*kernel_h*kernel_w, slice_oc_size, slice_ci1_size*kernel_h*kernel_w)
                                     bias_N1N0 = N2N1N0_L12PMB(bias, slice_oc_start_in_tensor, slice_oc_size)
                                     deq_N1N0 = N2N1N0_L12PMB(deq, slice_oc_start_in_tensor, slice_oc_size)
-                                    psb_addr = 
+                                    
+                                    # psb_addr 计算输出块的序列号
+                                    psb_addr = (slice_oh_start_in_tile//H_L0 * ceil_div(ow_size_tile, W_L0) + slice_ow_start_in_tile//W_L0 + \
+                                               slice_oc_start_in_tile//CO_L0 * ceil_div(oh_size_tile, H_L0) * ceil_div(ow_size_tile, W_L0))
+                                    
                                     result_m2n2m1n1m0n0_psb[psb_addr] = matmul_m1k1m0k0_n1k1n0k0(\
                                     result_m2n2m1n1m0n0_psb[psb_addr], ifm_M1K1M0K0, weight_N1K1N0K0_slice, bias_N1N0, deq_N1N0, ifm_M1K1M0K0.shape[0], weight_N1K1N0K0_slice.shape[0], ifm_M1K1M0K0.shape[1], bias_en, psum_en, deq_en)
                                     if(deq_en):
