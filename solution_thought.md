@@ -3,16 +3,16 @@
 > [!NOTE]
 > 本文档基于本项目 `step1.py` - `step4.py` 的**填空修改记录**，为你详细拆解整个项目的逻辑主线。在这个项目中，我们通过四个渐进式的 Python 脚本模拟了底层 AI 硬件（比如 NPU/TPU）处理矩阵乘法和卷积的过程。
 > 
-> 下面的讲解将结合你代码中填补的**关键公式与循环逻辑**，手把手带你理解为什么要这样算，以及怎样培养排错（Debug）的直觉。
+> 下面的讲解不仅结合了代码中填补的**关键公式与循环逻辑**，还给出了各个环节在出现 Bug 时的**具体报错表象**与**排错排查思路**。
 
 ---
 
 ## 📖 全局视角与硬件对齐理念
 
 在看具体的长串多维循环前，先在脑海中建立这个物理模型：
-1. **DDR（大仓库）**：数据以最线性的方式存放，比如普通的矩阵 `(M, K)` 或是 `(B, H, W, C)`。
-2. **L1 Buffer（大货架）**：由于 DDR 读取太慢，我们要把数据搬运到 L1 中。为了方便之后极速地被计算核心吞吐，数据要被重组成一种包含**分块参数**的多维排布，例如 `(M1, K1, M0, K0)`。
-3. **L0 Register / MAC 阵列（工作台）**：计算单元每次只能消化极小固定尺寸的矩阵块，本例中就是 `M0`、`N0`、`K0` 的大小（例如 `M0=3, N0=4, K0=5`）。
+1. **DDR（大仓库）**：数据以最线性的方式存放，比如普通的矩阵 `(M, K)` 或是图像数据 `(B, H, W, C)`。
+2. **L1 Buffer（片上缓存）**：由于 DDR 读取太慢，我们要把数据搬运到 L1 中。为了方便之后极速地被计算核心吞吐，数据要被重组成一种包含**分块参数**的多维排布，例如 `(M1, K1, M0, K0)`。
+3. **L0 Register / MAC 阵列（计算引擎）**：计算单元每次只能消化极小固定尺寸的矩阵块，本例中定义的架构参数为 `M0=3, N0=4, K0=5`。
 
 你的四个 `step` 脚本就是不断在实现：**如何正确切割 -> 搬运 -> 组合下标运算 -> 调用基础矩阵乘核心 -> 将结果写回**。
 
@@ -20,127 +20,152 @@
 
 ## 🛠️ Step 1: 矩阵分块与阵列核心计算模拟
 
-**目标**：理解 `M1K1M0K0` 是什么，以及 L0 层面的微缩矩阵运算。
+**目标**：理解 `M1K1M0K0` 布局结构的意义，以及硬件计算单元是如何以小卡片 `(M0, N0)` 为单位进行矩阵乘法的。
 
-### 代码填空思路深度解析
-在 `step1.py` 中，主要完成的是**核心循环**的逻辑和**坐标系拉平**的重构运算：
+### 核心代码拆解
+在 `step1.py` 中，主要完成的是**核心循环累加**与**坐标系拉平**：
 
-1. **底层小核心累加逻辑**：
+1. **底层小核心计算逻辑**：
+   在 TPU/NPU 内部，不可能一次吃下一个 $1000 \times 1000$ 的大矩阵，而是嵌套了外部分块循环 (`m1, n1`) 和内部累加循环 (`k1`)。
    ```python
-   # 针对当前 M1, N1 切片，初始化小方格累加器 temp
-   temp = np.zeros((M0, N0)) 
-   for k1 in range(K1):
-       # 核心计算单元 (L0层计算): 用 left_m1k1m0k0 和 right 转置做矩阵乘
-       temp += left_m1k1m0k0[m1][k1] @ right_n1k1n0k0[n1][k1].T
+   for m1 in range(M1):
+       for n1 in range(N1):
+           # 针对当前 (M1, N1) 分块，初始化一个小方格累加器 temp (相当于局部寄存器)
+           temp = np.zeros((M0, N0)) 
+           for k1 in range(K1):
+               # 核心单元计算: L(M0xK0) 乘以 R转置(K0xN0)，累加到 temp 的(M0xN0)里
+               temp += left_m1k1m0k0[m1][k1] @ right_n1k1n0k0[n1][k1].T
+               
+           # 跑完了所有的 k1 累加，当前这块结果写回 SRAM 缓存
+           result_m1n1m0n0[m1][n1] = temp
    ```
-   **【思考】**：为什么这里内部还要有一个 `for k1`？因为我们算结果矩阵特定的一小块 `(M0, N0)`，等于输入矩阵提取特定的 `M0` 行乘权重特定的 `N0` 列；而这由于 K 维度太大，K 被切成了 `K1` 份，这就需要分别乘完这 `K1` 份并累积在 `temp` 中。
+   *注意：代码里的 `@` 符号代表着底层电路级的一条 `MAC`（乘加）指令的宏观表现。*
 
-2. **全局结果逆向重组**：
-   在把分块结果 `result_m1n1m0n0` 写回普通矩阵 `result_mn` 时，填写的核心公式如下：
+2. **全局结果逆向重组与去 Padding**：
+   切分时因为使用了 `ceil_div`（向上取整对齐到 $M_0, N_0$），边缘会产生废数据（0）。写回普通矩阵 `result_mn` 时需要截断：
    ```python
-   # 计算出全局的绝对坐标
+   # 解析出的全局物理坐标：大块数 * 每块长度 + 块内偏移量
    m = m1 * M0 + m0
    n = n1 * N0 + n0
-   # 由于我们切分时可能向外取整了（ceil_div），这里必须把补的 Padding 去掉：
+   
+   # 防越界保护：必须把向外取整补的零 (Padding) 抛弃掉
    if m < M and n < N:
        result_mn[m][n] = result_m1n1m0n0[m1][n1][m0][n0]
    ```
 
 ---
 
-## 🛠️ Step 2: 内存排布与控制信号（核心流控）
+## 🛠️ Step 2: 内存排布与控制信号（全剧最关键流控）
 
-**目标**：理解从 `MK` 变成 `K1MK0` 的布局映射，以及 `bias`, `psum`, `deq` 触发时机。
+**目标**：理解从 `MK` 变成 `K1MK0` 的 Layout 映射公式，以及控制状态机里的 `bias`, `psum`, `deq` 触发时机。这段逻辑如果在芯片设计里写错，硬件会直接发生内存崩坏或计算错乱。
 
-### 代码填空思路深度解析
+### 核心代码拆解
 1. **DDR 到 L1 (将平铺二维变成多维排布)**：
-   在 `MK2K1MK0_DDR2L1` 方法中填空的逻辑为：
+   在 `MK2K1MK0_DDR2L1` 填空：
    ```python
-   # 获取原图 DDR 的一维坐标 K
+   # 计算原图 DDR 的一维线性绝对坐标 K
+   # k1 代表在第几个分块，K0 是块宽，k0 是块内第几个元素
    k = start_k + k1 * K0 + k0
-   # 防越界保护
+   
+   # 只有在有效数据范围内，才从 DDR(matrix_mk) 抠数据给到 SRAM(matrix_k1mk0)
    if k < start_k + tile_k and k < tensor_k:
        matrix_k1mk0[k1][m][k0] = matrix_mk[start_m + m][k]
    ```
-   **【思考】**：这是硬件中经典的 Layout Transformation 的软件模拟。`k1` 定位找哪个块，`k0` 定位找块内的哪个元素。
 
-2. **控制信号的触发条件 (最容易写错的地方)**：
-   这段填空直接决定了底层硬件数据流的生与死：
-   - **`bias_en = (tile_k_start_in_tensor == 0 and slice_k_start_in_tile == 0)`**
-     偏置加上去只能加一次。只有当这是该通道 `K` 维度的绝对第一次计算（即第一大块的第一小块），才启用 `bias_en`。
-   - **`psum_en = (tile_k_start_in_tensor != 0 or slice_k_start_in_tile != 0)`**
-     部分和使能信号。除了第一次计算不能累加上次结果，后面的每次切片循环，计算结果都要跟上次暂存格（PSB / Accumulator）的值进行累加！
-   - **`deq_en = is_last_k_in_tile and is_last_tile_in_k`**
-     反量化（dequantization）往往放在最后做。只有所有 `K` 维度都走完（意味着这个输出格子的加法都加透了），我们才允许进行后处理。
+2. **硬件控制信号的逻辑推演 (极易出错点)**：
+   在巨大的外层循环里，硬件何时加载 Bias，何时累加，何时释放反量化输出？
+   ```python
+   # bias_en：偏置加上去只能加一次。
+   # 只有当这是整个矩阵K维度的第一次大循环(tile_k) 的第一小分片(slice_k) 时，才为真。
+   bias_en = (tile_k_start_in_tensor == 0 and slice_k_start_in_tile == 0)
+   
+   # psum_en：部分和使能(Partial Sum)。
+   # 除了第一次计算，后面的所有切片循环，计算引擎产出的结果都必须跟缓存里的上次结果累加！
+   psum_en = (tile_k_start_in_tensor != 0 or slice_k_start_in_tile != 0)
+   
+   # deq_en：反量化。一定放在所有加法做完之后。
+   # 即当前 Tile 内走到最后一块的尽头，且当前全局的 Tile 也是最后一个 K。
+   is_last_k_in_tile = (slice_k_start_in_tile + k_size_slice >= k_size_tile_align_k0)
+   is_last_tile_in_k = (tile_k_start_in_tensor + k_size_tile >= TENSOR_K)
+   deq_en = is_last_k_in_tile and is_last_tile_in_k
+   ```
+
+### 🐞 Debug 经验 - Step 2 报错解析：
+如果你发现 `step2.py` 的测试用例跑出 `Fail`（金数据核对不上）：
+- **现象 A: 输出结果比预期大了很多，甚至翻倍。** $\rightarrow$ 重点查 `bias_en`。一定是你的 `bias_en` 在后面的循环里也被错误激活成了 `True`，导致加了多次偏置。
+- **现象 B: 输出结果严重不符，像丢了数据。** $\rightarrow$ 重点查 `psum_en`。很可能是你丢了上一轮的部分和（没有写回或者覆盖了）。
 
 ---
 
-## 🛠️ Step 3: Im2Col（卷积转矩阵灵魂映射）
+## 🛠️ Step 3: Im2Col（卷积转矩阵的灵魂映射）
 
-**目标**：理解如何不用 4 重循环滑动窗口写卷积，而是转为一次暴力的矩阵排布。
+**目标**：理解如何彻底消灭 4 重卷积滑动窗口循环，转为一次干净利落的大型矩阵排布。
 
-### 代码填空思路深度解析
-在 `CHW2MK` 这个函数里，你需要把输入图片的 `(Channel, Height, Width)` 填成 `(M, K)` 形式。这里你填了两个极度关键的映射公式：
+### 核心代码拆解
+在 `CHW2MK` 中，你需要把图片 `(Channel, Height, Width)` 填成 `(M, K)` 形式。这里你填了全场最重要的坐标映射系：
+
 ```python
-# 核心填空 1：由输出坐标与核坐标，计算原图真实起点的 ih，iw
-ih = oh * stride_h - pad_h + kh * dilation_h
-iw = ow * stride_w - pad_w + kw * dilation_w
-
-# 核心填空 2：边界防爆检查
-if (0 <= ih < in_height) and (0 <= iw < in_width):
-    ...
+for kh in range(kernel_h):
+    for kw in range(kernel_w):
+        # 核心映射：由当前输出图坐标 oh/ow 与滑动核座标 kh/kw，反推原图有效提取点 ih/iw
+        # 考虑的因素：(1) Stride 放大输出距离 (2) Padding 导致起始点向负方向左移 (3) Dilation 导致核内吸附像素点散开
+        ih = oh * stride_h - pad_h + kh * dilation_h
+        iw = ow * stride_w - pad_w + kw * dilation_w
+        
+        # 必须过滤掉打在外层 Padding 环境(负数或超图片范围) 上的光束
+        if (0 <= ih < in_height) and (0 <= iw < in_width):
+            for ic in range(in_channel):
+                # 利用 K 维度一维展平法则：ic权重最大，次之是 kh，最小是 kw
+                k_idx = ic * kernel_h * kernel_w + kh * kernel_w + kw
+                ofm[m_idx][k_idx] = ifm[ic][ih][iw]
 ```
-**【思考】**：
-- `oh * stride_h` ：输出 `oh` 像素等于核在原图走过的宏观步长距离。
-- `- pad_h`：因为左上角填充了补零层，真实的图片像素读取起始指针需要向“左上方”退回这么多值。
-- `kh * dilation_h`：解决膨胀卷积时核内部的像素间距放大。
-通过这个把图片“拉平”成一维宽长的举动，接下来的处理就全都可以套用前面的 `step1` 计算单元了！
+跑通 `im2col`，这意味着卷积问题正式被降维成了上面的 `Step1/2` 矩阵乘法问题。
 
 ---
 
-## 🛠️ Step 4: 大整合与动态 Padding 边界计算 (Boss战)
+## 🛠️ Step 4: 大整合与动态 Padding 边界计算 (压轴 Boss 战)
 
-**目标**：把 `im2col` 与多层分块嵌套。这里是报错的重灾区。
+**目标**：把 `im2col` 理论融入多重切分大 Tile 嵌套环境里面去。你将踩遍所有越界的坑。
 
-### 代码填空思路深度解析
-我们来看看 `test_convolution()` 里面你填的四向 `padding` 切分逻辑：
+### 核心代码拆解与调试心得
+在 `test_convolution()` 中有六层的嵌套循环，其中**最容易算死人的是对动态切片 `slice_pad_r/b` 的推断**：
 
-1. **为什么切分出的大 Tile 或者 Slice 还要算 Padding?**
-   原始参数里的 `pad_h` 和 `pad_w` 是针对**全图**的。但是图片被切成几十个方格小块运算时，只有**贴图边缘的方格**会取到补零部分，中间的方格是不需要补的！你需要通过比较绝对坐标，看它是不是出界了：
+1. **为什么切分出的大 Tile 还要重算边界 Padding?**
+   原始的 `pad_h` 和 `pad_w` 参数是糊在屏幕整张图片上的。当我们把图片切成了 20 个格子，**位于图片中央的格子在取卷积窗数据时，是绝对碰不到补零的！**
+   只有最贴右边、最贴下边的格子，它的卷积核伸到了图片虚无外场，才需要补零。这就叫**局部 Padding 动态计算**。
    
-   **上边补零 (`slice_pad_t`) 填空思路**：
+   **你填补的下边补零 (`slice_pad_b`) 思路**：
    ```python
-   # 如果目前我这个切片的绝对起始点，向上走了 pad步后，变成负数了
-   if(slice_oh_start_in_tensor * stride_h - pad_h < 0):
-       # 收不回来那么多行，说明上面悬空，这些悬空的行数就成了补零数量
-       slice_pad_t = pad_h - slice_oh_start_in_tensor * stride_h
+   # 当这个切分块覆盖的终点在加上整个核（含有膨胀因子）覆盖距离后，超出了图片最底下边界 in_height
+   if(slice_oh_end_in_tensor * stride_h - pad_h + dilation_h * (kernel_h - 1) >= in_height):
+       # 那么超出悬空的这段差值，就是这个切片需要局域补充的 padding bottom
+       slice_pad_b = (slice_oh_end_in_tensor * stride_h - pad_h + dilation_h * (kernel_h - 1)) - (in_height - 1)
    else:
-       slice_pad_t = 0
-   ```
-   
-   **右边补零 (`slice_pad_r`) 填空思路**：
-   ```python
-   # 这个切片的绝对终点 + 膨胀后整个核的真实横跨大小 >= 图片宽度全长
-   if(slice_ow_end_in_tensor * stride_w - pad_w + dilation_w * (kernel_w - 1) >= in_width):
-       # 说明超出右边界了，超出的部分就是我们这个块局部的 pad_r
-       slice_pad_r = (slice_ow_end_in_tensor * stride_w - pad_w + dilation_w * (kernel_w - 1)) - (in_width - 1)
-   else:
-       slice_pad_r = 0
+       slice_pad_b = 0  # 没触底，就在图片内部，padding为0
    ```
 
-2. **复杂的一维内存切分编号 (`psb_addr`) 填空思路**：
+2. **一维内存编号运算**：
    ```python
    psb_addr = (slice_oh_start_in_tile//H_L0 * ceil_div(ow_size_tile, W_L0) + slice_ow_start_in_tile//W_L0 + \
                slice_oc_start_in_tile//CO_L0 * ceil_div(oh_size_tile, H_L0) * ceil_div(ow_size_tile, W_L0))
    ```
-   **【思考】**：这看起来很吓人。但实际上，你只要把它想成把 `OH` 维度、`OW` 维度、`OC` 维度转成一维标号。公式就是：`Z_index * (X的长度 * Y的长度) + Y_index * (X的长度) + X_index` 的经典降维打击。
+   **逻辑拆解**：把它看成一个扁平化公式：`Z层数 * (当前层总容量：X总长度 * Y总长度) + Y排数 * (每一排的X容量：X总长度) + X柱子偏移`。这里 `X` 是块宽，`Y` 是块高，`Z` 对应通道维度。
 
----
+### 🐞 Step 4 究极 Debug 指南：被列表越界支配的恐惧
+如果你在 `step4.py` 中看到了满屏红色的 `IndexError: index X is out of bounds for axis Y`，按照以下步骤排摸：
 
-## 🎯 给新手的全盘通关与 Debug 建议
+- **第一步：锁死变量降维打击**。绝对不要硬着头皮去瞪六层外循环。
+  - 把用例生成器的参数改死：`stride_h=1`, `pad_h=0`, `dilation=1`。
+  - 如果连这种最简用例也出 `IndexError` 报错，说明你的 `L1` -> `L0` 的绝对坐标推导崩了。去找 `m_index = b * slice_oh * slice_ow + oh * slice_ow + ow` 这行，仔细对对乘的系数。
 
-你一定在写这堆填空时体会到了被张量下标支配的恐惧。送上三点通关锦囊：
+- **第二步：纸笔画图打印核对**。
+  - 如果只有带了 `Padding` 和 `Stride=2` 时才会崩，报错多半指向在生成 `ifm_m1k1m0k0` 的数组构建位置。
+  - 原因很简单，你通过那堆复杂的 `slice_pad_b` 算出的边界有偏差。
+  - **解决方案**：在这个代码位置插两个 `print`。
+    ```python
+    print(f"当前块起点: {slice_oh_start_in_tensor}, 核算pad_b为: {slice_pad_b}")
+    ```
+    拿一张纸，画一个 $6 \times 6$ 大小的二维网格充当原图，把当前起点的坐标落笔点在格子上。用核大小 `kernel_h=3`, 步长 `stride=2` 往前画一个框。你肉眼看到超出格子的长度，如果和你 `print` 的 `slice_pad_b` 不一样（例如相差了 1 ），那么就意味着由于 `>=` 或 `-1` 边界闭区间没处理好，你的算法写错了。
 
-1. **别光看，画出来**：很多 Bug 源于 `ceil_div`（向上取整）没有对齐。遇到 `slice_pad` 不断引发数组越界的报错时，找张草稿纸画一个简单的 $5 \times 5$ 表格，令 `stride=2`、原图 `pad=1`，手套公式验证你的 `slice_pad_r` 是不是多加了或少减了 `1`。
-2. **控制变量隔离除错**：只要把 `step4.py` 测试用例中随机生成的 `pad` 写死成 0、`stride` 写进死成 1、`dilation` 写死成 1。如果跑不通，说明问题出在最基础的 L1 -> L0 坐标取样；如果跑通了而放开随机数后失败，那 Bug 100% 在上面那段四处寻找 `slice_pad` 悬空的 if/else 逻辑中。
-3. **通过此项目的蜕变**：一旦你走通了这四个步骤，你对于 AI 底层那些形似天书的矩阵计算库，诸如 Cutlass，或者一些芯片 SDK 文档里描述的数据排布（`NC1HWC0` 之类）都不再会感到陌生。因为你亲手完成了一个 TPU 中最高难度的特征搬起与数据流控制。
+> **终极结语**
+> 走通这个步骤不仅让你熟练运用 Numpy 张量魔法，更是逼你切换回底层电子工程师的视角：一切高深复杂的运算网络，在硬件寄存器里不过就是一群小蚂蚁排布着极其精妙的列阵，精准地踏着 `m` 和 `k` 的步点，在正确的时钟信号触发下进出存储器罢了。
